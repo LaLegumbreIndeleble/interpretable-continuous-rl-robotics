@@ -1,0 +1,11 @@
+[project]
+name = "interpretable-continuous-rl-robotics"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "deap>=1.4.3",
+    "gymnasium[box2d]>=1.2.3",
+    "numpy>=2.4.3",
+]

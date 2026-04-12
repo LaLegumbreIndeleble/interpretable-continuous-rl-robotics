@@ -43,3 +43,6 @@ multirun/
 # MuJoCo
 *.mjcf
 *.xml.bak
+
+# GP saved models (binary)
+best_model/*.pkl
