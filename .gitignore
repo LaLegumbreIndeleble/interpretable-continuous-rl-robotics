@@ -45,4 +45,10 @@ multirun/
 *.xml.bak
 
 # GP saved models (binary)
-best_model/*.pkl
+best_model/
+best_model_v2/
+best_model_v3/
+best_model_v4/
+
+# CGP++ C++ reference (cloned external repo, not part of this project)
+cgp_plusplus_ref/

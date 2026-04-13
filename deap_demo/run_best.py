@@ -17,7 +17,7 @@ from deap import gp
 
 # ── locate saved model ────────────────────────────────────────
 _DIR = os.path.dirname(__file__)
-MODEL_PATH = os.path.join(_DIR, "best_model", "best_individual.pkl")
+MODEL_PATH = os.path.join(_DIR, "best_model_v2", "best_individual.pkl")
 
 # ── must import bipedal_gp so creator / pset are registered ──
 # (pickle needs the same class definitions that were used to save)
@@ -30,10 +30,10 @@ _mod = importlib.util.module_from_spec(_spec)
 sys.modules["bipedal_gp"] = _mod
 _spec.loader.exec_module(_mod)
 
-pset         = _mod.pset
-N_ACTIONS    = _mod.N_ACTIONS
+pset = _mod.pset
+N_ACTIONS = _mod.N_ACTIONS
 ACTION_NAMES = _mod.ACTION_NAMES
-MAX_STEPS    = _mod.MAX_STEPS
+MAX_STEPS = _mod.MAX_STEPS
 
 
 def load_best():
@@ -59,9 +59,9 @@ def run(individual, render: bool, n_episodes: int, seed: int = 0):
         total = 0.0
         for _ in range(MAX_STEPS):
             try:
-                action = np.clip(
-                    [float(fn(*obs)) for fn in fns], -1.0, 1.0
-                ).astype(np.float32)
+                action = np.clip([float(fn(*obs)) for fn in fns], -1.0, 1.0).astype(
+                    np.float32
+                )
             except Exception:
                 action = np.zeros(N_ACTIONS, dtype=np.float32)
             obs, reward, terminated, truncated, _ = env.step(action)
@@ -81,7 +81,7 @@ def run(individual, render: bool, n_episodes: int, seed: int = 0):
 def main():
     parser = argparse.ArgumentParser(description="Run the best GP controller.")
     parser.add_argument("--episodes", type=int, default=3)
-    parser.add_argument("--render",    action="store_true", default=True)
+    parser.add_argument("--render", action="store_true", default=True)
     parser.add_argument("--no-render", dest="render", action="store_false")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
