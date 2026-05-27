@@ -1,29 +1,34 @@
 """
-DEAP GP Controller — BipedalWalker-v3  (A2C architecture, 9-tree)
-==================================================================
-Architecture: 9 trees per individual
-  trees 0-3  (mu)    → raw action proposals; tanh applied externally → ∈ (-1, 1)
-  trees 4-7  (var)   → raw variance proposals; shifted-softplus → ≥ 0
-  tree  8    (critic) → TD(0) baseline V(s), gates actions at runtime
+DEAP GP Controller — BipedalWalker-v3  (D4PG architecture, 15-tree)
+====================================================================
+Architecture: 4 + N_ATOMS trees per individual
+  trees 0-3    (actor)  → deterministic action means, tanh output
+  trees 4-14   (critic) → N_ATOMS=11 logits for categorical Q distribution
 
-Fitness = mean episode reward.
+vs GP DDPG (5-tree):
+  - Critic outputs a categorical distribution over N_ATOMS return bins
+    (C51-style) instead of a single scalar Q
+  - Gaussian noise epsilon=0.3 replaces OU (simpler, stateless — D4PG
+    authors found both perform equally)
+  - Expected Q = dot(softmax(logits), atom_supports) collapses the
+    distribution to a scalar for action gating
 
-Probe step samples N(mu, sigma) for exploration; the COMMITTED action gates
-the deterministic mu (not the noisy sample) so fitness evaluations are
-consistent across runs and selection pressure is clean.
+    mu         = tanh(actor_i(*obs))
+    a_gauss    = clip(mu + EPSILON * N(0,1), -1, 1)    ← explore
+    logits     = [critic_k(*obs, *a_gauss) for k in 0..N_ATOMS-1]
+    probs      = softmax(logits)
+    E[Q]       = dot(probs, supports)                   ← expected Q
+    gate       = sigmoid(E[Q])
+    action     = clip(a_gauss * gate, -1, 1)            ← commit
 
-    mu         = tanh(mu_tree(*obs))                    ← bounded mean
-    sigma      = sqrt(max(softplus(var_tree(*obs)) - log(2), 1e-6))
-                                                         ← var trees can reach 0
-    a_samp ~ N(mu, sigma), clipped to [-1, 1]           ← stochastic probe
-    v          = critic(*obs)
-    v_next     = critic(*obs_after_probe)
-    advantage  = reward_probe + 0.99*v_next - v
-    gate       = sigmoid(advantage)
-    action     = clip(mu * gate, -1, 1)                 ← deterministic commit
+Atom supports: N_ATOMS=11 atoms over [Vmin=-200, Vmax=300]
+  → DELTA_Z = 50 per atom (tuned to BipedalWalker's return range)
+
+pset_actor : 24 inputs (obs)
+pset_critic: 28 inputs (24 obs + 4 actions)  — same as GP DDPG
 
 Run:
-    uv run bipedal_gp_a2c/bipedal_gp_a2c.py
+    uv run bipedal_gp_a2c/bipedal_gp_d4pg.py
 """
 
 import operator
@@ -38,24 +43,35 @@ import numpy as np
 from deap import base, creator, gp, tools
 import gymnasium as gym
 
-BEST_MODEL_DIR = os.path.join(os.path.dirname(__file__), "best_model_a2c")
+BEST_MODEL_DIR = os.path.join(os.path.dirname(__file__), "best_model_d4pg")
 
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
 N_OBS     = 24
 N_ACTIONS = 4
-IDX_VAR   = N_ACTIONS          # var trees: indices 4-7
-IDX_VALUE = N_ACTIONS * 2      # critic tree: index 8
-N_TOTAL   = N_ACTIONS * 2 + 1  # 9 total
+
+# Distributional critic
+N_ATOMS = 11
+Vmin    = -200.0
+Vmax    =  300.0
+DELTA_Z = (Vmax - Vmin) / (N_ATOMS - 1)
+SUPPORTS = [Vmin + i * DELTA_Z for i in range(N_ATOMS)]
+
+IDX_CRITIC_START = N_ACTIONS              # first critic tree index (4)
+IDX_CRITIC_END   = N_ACTIONS + N_ATOMS    # one past last critic tree (15)
+N_TOTAL          = N_ACTIONS + N_ATOMS    # 15 total
+
+# Gaussian exploration (D4PG replaces OU with plain Gaussian)
+EPSILON = 0.3
 
 N_ISLANDS      = 4
-ISLAND_SIZE    = 50             # total pop = 200
+ISLAND_SIZE    = 50
 MIGRATION_FREQ = 10
 MIGRATION_SIZE = 5
 
-N_GEN      = 2000               # time limit stops first
-N_EPISODES = 10
+N_GEN      = 2000
+N_EPISODES = 5
 MAX_STEPS  = 1600
 
 CXPB = 0.65
@@ -64,8 +80,7 @@ TREE_MAX_H = 6
 
 STAGNATION_LIMIT = 15
 IMMIGRANT_RATIO  = 0.15
-CRITIC_MUTPB     = 0.10  # critic mutates least — needs to stabilize
-VAR_MUTPB        = 0.15  # var trees mutate less than mu, more than critic
+CRITIC_MUTPB     = 0.10   # per-atom tree mutation rate
 
 TIMEOUT_PENALTY  = 50.0  # subtracted when episode ends by time truncation (stood still)
 
@@ -84,112 +99,118 @@ ACTION_NAMES = ["hip_L", "knee_L", "hip_R", "knee_R"]
 def safe_div(a, b):
     return a / b if abs(b) > 1e-6 else 0.0
 
-
 def safe_log(a):
     return math.log(abs(a) + 1e-6)
-
 
 def safe_sqrt(a):
     return math.sqrt(abs(a))
 
-
 def safe_exp(a):
     return math.exp(max(-10.0, min(10.0, a)))
-
 
 def safe_tanh(a):
     return math.tanh(a)
 
-
 def safe_sin(a):
     return math.sin(a)
-
 
 def safe_cos(a):
     return math.cos(a)
 
-
 def safe_sigmoid(a):
     return 1.0 / (1.0 + math.exp(-max(-10.0, min(10.0, a))))
-
 
 def safe_abs(a):
     return abs(a)
 
-
 def safe_max2(a, b):
     return max(a, b)
-
 
 def safe_min2(a, b):
     return min(a, b)
 
-
 def if_pos(cond, a, b):
-    """Conditional: if cond > 0 return a else return b."""
     return a if cond > 0.0 else b
 
-
 def safe_softplus(a):
-    """Softplus: log(1 + exp(a)), linear for large a to avoid overflow."""
     return a if a > 20.0 else math.log(1.0 + math.exp(a))
 
-
 def safe_sigmoid_scalar(x):
-    """Sigmoid used outside the primitive set (action gating)."""
     return 1.0 / (1.0 + math.exp(-max(-10.0, min(10.0, x))))
 
 
 # ─────────────────────────────────────────────
-# PRIMITIVE SET
+# DISTRIBUTIONAL HELPERS
 # ─────────────────────────────────────────────
-pset = gp.PrimitiveSet("CTRL", N_OBS)
+def softmax_list(xs):
+    """Numerically stable softmax over a Python list."""
+    m = max(xs)
+    exps = [math.exp(x - m) for x in xs]
+    s = sum(exps)
+    return [e / s for e in exps]
 
-obs_names = {
-    "ARG0": "hull_angle",
-    "ARG1": "hull_angvel",
-    "ARG2": "vel_x",
-    "ARG3": "vel_y",
-    "ARG4": "hip_L_angle",
-    "ARG5": "hip_L_speed",
-    "ARG6": "knee_L_angle",
-    "ARG7": "knee_L_speed",
-    "ARG8": "leg_L_contact",
-    "ARG9": "hip_R_angle",
-    "ARG10": "hip_R_speed",
-    "ARG11": "knee_R_angle",
-    "ARG12": "knee_R_speed",
+
+def expected_q(logits):
+    """E[Q] = sum(softmax(logits) * supports)."""
+    probs = softmax_list(logits)
+    return sum(p * z for p, z in zip(probs, SUPPORTS))
+
+
+# ─────────────────────────────────────────────
+# PRIMITIVE SETS  (actor: 24 inputs, critic: 28)
+# ─────────────────────────────────────────────
+_PRIMITIVES = [
+    (operator.add,  2, "add"),
+    (operator.sub,  2, "sub"),
+    (operator.mul,  2, "mul"),
+    (safe_div,      2, "div"),
+    (safe_max2,     2, "max2"),
+    (safe_min2,     2, "min2"),
+    (if_pos,        3, "if_pos"),
+    (safe_tanh,     1, "tanh"),
+    (safe_sin,      1, "sin"),
+    (safe_cos,      1, "cos"),
+    (safe_sigmoid,  1, "sigmoid"),
+    (safe_abs,      1, "abs"),
+    (operator.neg,  1, "neg"),
+    (safe_sqrt,     1, "sqrt"),
+    (safe_log,      1, "log"),
+    (safe_exp,      1, "exp"),
+    (safe_softplus, 1, "softplus"),
+]
+
+def _build_pset(name, n_inputs):
+    ps = gp.PrimitiveSet(name, n_inputs)
+    for fn, arity, pname in _PRIMITIVES:
+        ps.addPrimitive(fn, arity, name=pname)
+    ps.addEphemeralConstant(f"c_s_{name}", functools.partial(random.uniform, -1.0, 1.0))
+    ps.addEphemeralConstant(f"c_l_{name}", functools.partial(random.uniform, -3.0, 3.0))
+    return ps
+
+_OBS_NAMES = {
+    "ARG0":  "hull_angle",    "ARG1":  "hull_angvel",
+    "ARG2":  "vel_x",         "ARG3":  "vel_y",
+    "ARG4":  "hip_L_angle",   "ARG5":  "hip_L_speed",
+    "ARG6":  "knee_L_angle",  "ARG7":  "knee_L_speed",
+    "ARG8":  "leg_L_contact",
+    "ARG9":  "hip_R_angle",   "ARG10": "hip_R_speed",
+    "ARG11": "knee_R_angle",  "ARG12": "knee_R_speed",
     "ARG13": "leg_R_contact",
     **{f"ARG{14+i}": f"lidar_{i}" for i in range(10)},
 }
-pset.renameArguments(**obs_names)
 
-# Binary
-pset.addPrimitive(operator.add, 2, name="add")
-pset.addPrimitive(operator.sub, 2, name="sub")
-pset.addPrimitive(operator.mul, 2, name="mul")
-pset.addPrimitive(safe_div, 2, name="div")
-pset.addPrimitive(safe_max2, 2, name="max2")
-pset.addPrimitive(safe_min2, 2, name="min2")
+pset_actor = _build_pset("ACTOR", N_OBS)
+pset_actor.renameArguments(**_OBS_NAMES)
 
-# Ternary
-pset.addPrimitive(if_pos, 3, name="if_pos")
+pset_critic = _build_pset("CRITIC", N_OBS + N_ACTIONS)
+pset_critic.renameArguments(**{
+    **_OBS_NAMES,
+    "ARG24": "action_hip_L",
+    "ARG25": "action_knee_L",
+    "ARG26": "action_hip_R",
+    "ARG27": "action_knee_R",
+})
 
-# Unary
-pset.addPrimitive(safe_tanh, 1, name="tanh")
-pset.addPrimitive(safe_sin, 1, name="sin")
-pset.addPrimitive(safe_cos, 1, name="cos")
-pset.addPrimitive(safe_sigmoid, 1, name="sigmoid")
-pset.addPrimitive(safe_abs, 1, name="abs")
-pset.addPrimitive(operator.neg, 1, name="neg")
-pset.addPrimitive(safe_sqrt, 1, name="sqrt")
-pset.addPrimitive(safe_log, 1, name="log")
-pset.addPrimitive(safe_exp, 1, name="exp")
-pset.addPrimitive(safe_softplus, 1, name="softplus")  # for var trees
-
-# Two constant pools
-pset.addEphemeralConstant("c_s", functools.partial(random.uniform, -1.0, 1.0))
-pset.addEphemeralConstant("c_l", functools.partial(random.uniform, -3.0, 3.0))
 
 # ─────────────────────────────────────────────
 # INDIVIDUAL & TOOLBOX
@@ -198,12 +219,14 @@ creator.create("FitnessMax", base.Fitness, weights=(1.0,))
 creator.create("Individual", list, fitness=creator.FitnessMax)
 
 toolbox = base.Toolbox()
-toolbox.register("expr", gp.genHalfAndHalf, pset=pset, min_=1, max_=TREE_MAX_H)
-toolbox.register("tree", tools.initIterate, gp.PrimitiveTree, toolbox.expr)
+toolbox.register("expr_actor",  gp.genHalfAndHalf, pset=pset_actor,  min_=1, max_=TREE_MAX_H)
+toolbox.register("expr_critic", gp.genHalfAndHalf, pset=pset_critic, min_=1, max_=TREE_MAX_H)
 
 
 def make_individual():
-    return creator.Individual([toolbox.tree() for _ in range(N_TOTAL)])
+    actor_trees  = [gp.PrimitiveTree(toolbox.expr_actor())  for _ in range(N_ACTIONS)]
+    critic_trees = [gp.PrimitiveTree(toolbox.expr_critic()) for _ in range(N_ATOMS)]
+    return creator.Individual(actor_trees + critic_trees)
 
 
 toolbox.register("individual", make_individual)
@@ -215,9 +238,8 @@ toolbox.register("population", tools.initRepeat, list, toolbox.individual)
 # ─────────────────────────────────────────────
 def evaluate(individual):
     try:
-        mu_fns  = [gp.compile(individual[i],           pset) for i in range(N_ACTIONS)]
-        var_fns = [gp.compile(individual[IDX_VAR + i], pset) for i in range(N_ACTIONS)]
-        value_fn = gp.compile(individual[IDX_VALUE],   pset)
+        actor_fns  = [gp.compile(individual[i],                   pset_actor)  for i in range(N_ACTIONS)]
+        critic_fns = [gp.compile(individual[IDX_CRITIC_START + k], pset_critic) for k in range(N_ATOMS)]
     except Exception:
         return (-200.0,)
 
@@ -230,60 +252,44 @@ def evaluate(individual):
         timed_out = False
 
         for _ in range(MAX_STEPS):
-            # ── evaluate mu and var at current obs ─────────────
+            # ── deterministic actor ────────────────────────────
             try:
-                mu_raw  = [float(fn(*obs)) for fn in mu_fns]
-                var_raw = [float(fn(*obs)) for fn in var_fns]
-                if not all(math.isfinite(x) for x in mu_raw + var_raw):
+                mu_raw = [float(fn(*obs)) for fn in actor_fns]
+                if not all(math.isfinite(x) for x in mu_raw):
                     raise ValueError
             except Exception:
                 total = -200.0
                 break
 
-            # ── A2C-style stochastic action ────────────────────
-            mu    = [math.tanh(m) for m in mu_raw]
-            var   = [max(safe_softplus(r), 1e-6) for r in var_raw]
-            sigma = [math.sqrt(v) for v in var]
-            a_samp = np.clip(
-                [mu[i] + sigma[i] * random.gauss(0, 1) for i in range(N_ACTIONS)],
+            mu = np.array([math.tanh(m) for m in mu_raw], dtype=np.float32)
+
+            # ── Gaussian exploration (D4PG: no OU, plain N(0,1)) ──
+            a_gauss = np.clip(
+                mu + EPSILON * np.random.normal(size=N_ACTIONS).astype(np.float32),
                 -1.0, 1.0,
             ).astype(np.float32)
 
-            # ── probe step with sampled action ─────────────────
-            obs_next, reward, terminated, truncated, _ = env.step(a_samp)
-
-            # ── TD(0) advantage from critic ────────────────────
+            # ── distributional Q: N_ATOMS logits → expected Q ──
             try:
-                v      = float(value_fn(*obs))
-                v_next = float(value_fn(*obs_next))
-                if not math.isfinite(v) or not math.isfinite(v_next):
+                logits = [float(fn(*obs, *a_gauss)) for fn in critic_fns]
+                if not all(math.isfinite(x) for x in logits):
                     raise ValueError
+                eq = expected_q(logits)
             except Exception:
-                v = 0.0
-                v_next = 0.0
+                eq = 0.0
 
-            advantage = reward + 0.99 * v_next - v
+            # ── gate by expected Q ─────────────────────────────
+            gate   = safe_sigmoid_scalar(eq)
+            action = np.clip(a_gauss * gate, -1.0, 1.0).astype(np.float32)
 
-            # ── gate: positive surprise → act boldly,
-            #          negative surprise → retreat toward 0
-            gate   = safe_sigmoid_scalar(advantage)
-            action = np.clip(
-                [mu[i] * gate for i in range(N_ACTIONS)],
-                -1.0, 1.0,
-            ).astype(np.float32)
-
-            # ── commit gated action ────────────────────────────
-            obs_next2, reward2, terminated, truncated, _ = env.step(action)
-            total += reward2
-
-            obs = obs_next2
+            obs, reward, terminated, truncated, _ = env.step(action)
+            total += reward
             if terminated or truncated:
                 timed_out = truncated and not terminated
                 break
         else:
             timed_out = True  # MAX_STEPS exhausted without env signal
 
-        # penalize standing still — truncation means the robot never finished
         if timed_out:
             total -= TIMEOUT_PENALTY
 
@@ -300,59 +306,45 @@ toolbox.register("evaluate", evaluate)
 # GENETIC OPERATORS
 # ─────────────────────────────────────────────
 def cx_individual(ind1, ind2):
-    for i in range(N_TOTAL):
+    for i in range(N_ACTIONS):  # actor trees
         if random.random() < 0.5:
             ind1[i], ind2[i] = gp.cxOnePoint(ind1[i], ind2[i])
+    for k in range(N_ATOMS):    # critic atom trees (same pset, safe to cross)
+        if random.random() < 0.5:
+            j = IDX_CRITIC_START + k
+            ind1[j], ind2[j] = gp.cxOnePoint(ind1[j], ind2[j])
     return ind1, ind2
 
 
+def _mutate_tree(tree, expr, pset):
+    roll = random.random()
+    if roll < 0.60:
+        return gp.mutUniform(tree, expr=expr, pset=pset)[0]
+    elif roll < 0.85:
+        return gp.mutNodeReplacement(tree, pset=pset)[0]
+    else:
+        return gp.mutShrink(tree)[0]
+
+
 def mut_individual(ind):
-    # mu trees — standard rate
     for i in range(N_ACTIONS):
         if random.random() < MUTPB:
-            roll = random.random()
-            if roll < 0.60:
-                (ind[i],) = gp.mutUniform(ind[i], expr=toolbox.expr, pset=pset)
-            elif roll < 0.85:
-                (ind[i],) = gp.mutNodeReplacement(ind[i], pset=pset)
-            else:
-                (ind[i],) = gp.mutShrink(ind[i])
-
-    # var trees — conservative (positivity enforced externally, less churn helps)
-    for i in range(N_ACTIONS):
-        if random.random() < VAR_MUTPB:
-            roll = random.random()
-            if roll < 0.60:
-                (ind[IDX_VAR + i],) = gp.mutUniform(ind[IDX_VAR + i], expr=toolbox.expr, pset=pset)
-            elif roll < 0.85:
-                (ind[IDX_VAR + i],) = gp.mutNodeReplacement(ind[IDX_VAR + i], pset=pset)
-            else:
-                (ind[IDX_VAR + i],) = gp.mutShrink(ind[IDX_VAR + i])
-
-    # critic tree — most conservative
-    if random.random() < CRITIC_MUTPB:
-        (ind[IDX_VALUE],) = gp.mutUniform(
-            ind[IDX_VALUE], expr=toolbox.expr, pset=pset)
-
+            ind[i] = _mutate_tree(ind[i], toolbox.expr_actor, pset_actor)
+    for k in range(N_ATOMS):
+        if random.random() < CRITIC_MUTPB:
+            j = IDX_CRITIC_START + k
+            ind[j] = _mutate_tree(ind[j], toolbox.expr_critic, pset_critic)
     return (ind,)
 
 
-toolbox.register("mate", cx_individual)
+toolbox.register("mate",   cx_individual)
 toolbox.register("mutate", mut_individual)
 toolbox.register("select", tools.selTournament, tournsize=5)
 
-toolbox.decorate(
-    "mate",
-    gp.staticLimit(
-        key=lambda ind: max(t.height for t in ind), max_value=TREE_MAX_H + 2
-    ),
-)
-toolbox.decorate(
-    "mutate",
-    gp.staticLimit(
-        key=lambda ind: max(t.height for t in ind), max_value=TREE_MAX_H + 2
-    ),
-)
+toolbox.decorate("mate",   gp.staticLimit(
+    key=lambda ind: max(t.height for t in ind), max_value=TREE_MAX_H + 2))
+toolbox.decorate("mutate", gp.staticLimit(
+    key=lambda ind: max(t.height for t in ind), max_value=TREE_MAX_H + 2))
 
 
 # ─────────────────────────────────────────────
@@ -366,10 +358,8 @@ def migrate(islands):
         top = tools.selBest(isle, MIGRATION_SIZE)
         migrants.append([toolbox.clone(ind) for ind in top])
     for i, isle in enumerate(islands):
-        worst_idx = sorted(range(len(isle)), key=lambda j: isle[j].fitness.values[0])[
-            :MIGRATION_SIZE
-        ]
-        incoming = migrants[(i - 1) % n]
+        worst_idx = sorted(range(len(isle)), key=lambda j: isle[j].fitness.values[0])[:MIGRATION_SIZE]
+        incoming  = migrants[(i - 1) % n]
         for rank, idx in enumerate(worst_idx):
             isle[idx] = incoming[rank]
 
@@ -379,9 +369,7 @@ def inject_immigrants(island, n_immigrants):
     new_inds = [make_individual() for _ in range(n_immigrants)]
     for ind, fit in zip(new_inds, map(toolbox.evaluate, new_inds)):
         ind.fitness.values = fit
-    worst_idx = sorted(range(len(island)), key=lambda j: island[j].fitness.values[0])[
-        :n_immigrants
-    ]
+    worst_idx = sorted(range(len(island)), key=lambda j: island[j].fitness.values[0])[:n_immigrants]
     for rank, idx in enumerate(worst_idx):
         island[idx] = new_inds[rank]
 
@@ -390,24 +378,24 @@ def inject_immigrants(island, n_immigrants):
 # PRINT
 # ─────────────────────────────────────────────
 def print_individual(ind, label=""):
-    print(f"\n{'─'*66}")
+    print(f"\n{'─'*70}")
     print(f"  {label}  |  fitness = {ind.fitness.values[0]:.4f}")
-    print(f"{'─'*66}")
+    print(f"{'─'*70}")
     for i in range(N_ACTIONS):
-        print(f"  mu  [{i}] ({ACTION_NAMES[i]:8s}) = {ind[i]}")
-    for i in range(N_ACTIONS):
-        print(f"  var [{i}] ({ACTION_NAMES[i]:8s}) = {ind[IDX_VAR + i]}")
-    print(f"  critic              = {ind[IDX_VALUE]}")
-    print(f"{'─'*66}")
+        print(f"  actor  [{i}] ({ACTION_NAMES[i]:8s}) = {ind[i]}")
+    for k in range(N_ATOMS):
+        support_val = Vmin + k * DELTA_Z
+        print(f"  critic [{k:2d}] (atom {support_val:+.0f}) = {ind[IDX_CRITIC_START + k]}")
+    print(f"{'─'*70}")
 
 
 # ─────────────────────────────────────────────
-# DETERMINISTIC EVAL  (mu only, mirrors Ch.15 test_net)
+# DETERMINISTIC EVAL  (no noise, no gate — mirrors test_net)
 # ─────────────────────────────────────────────
 def eval_deterministic(individual, n_episodes=10, render=False):
-    """Evaluate best individual using mu only (no sampling) for clean comparison."""
+    """Evaluate using actor output only (no Gaussian noise, no gate)."""
     try:
-        mu_fns = [gp.compile(individual[i], pset) for i in range(N_ACTIONS)]
+        actor_fns = [gp.compile(individual[i], pset_actor) for i in range(N_ACTIONS)]
     except Exception:
         return -200.0
 
@@ -420,7 +408,7 @@ def eval_deterministic(individual, n_episodes=10, render=False):
         total = 0.0
         while True:
             try:
-                mu_raw = [float(fn(*obs)) for fn in mu_fns]
+                mu_raw = [float(fn(*obs)) for fn in actor_fns]
                 action = np.clip([math.tanh(m) for m in mu_raw], -1.0, 1.0)
             except Exception:
                 action = np.zeros(N_ACTIONS)
@@ -442,21 +430,20 @@ def eval_deterministic(individual, n_episodes=10, render=False):
 # ─────────────────────────────────────────────
 def _save_best(best, training_log):
     os.makedirs(BEST_MODEL_DIR, exist_ok=True)
-
     with open(os.path.join(BEST_MODEL_DIR, "best_individual.pkl"), "wb") as f:
         pickle.dump(best, f)
-
     meta = {
-        "fitness":     best.fitness.values[0],
-        "mu_trees":    {ACTION_NAMES[i]: str(best[i])           for i in range(N_ACTIONS)},
-        "var_trees":   {ACTION_NAMES[i]: str(best[IDX_VAR + i]) for i in range(N_ACTIONS)},
-        "critic_tree": str(best[IDX_VALUE]),
+        "fitness":      best.fitness.values[0],
+        "actor_trees":  {ACTION_NAMES[i]: str(best[i]) for i in range(N_ACTIONS)},
+        "critic_trees": {
+            f"atom_{k}_support_{Vmin + k * DELTA_Z:+.0f}": str(best[IDX_CRITIC_START + k])
+            for k in range(N_ATOMS)
+        },
+        "supports": SUPPORTS,
     }
     with open(os.path.join(BEST_MODEL_DIR, "best_individual.json"), "w") as f:
         json.dump(meta, f, indent=2)
-
-    log_path = os.path.join(BEST_MODEL_DIR, "training_log.json")
-    with open(log_path, "w") as f:
+    with open(os.path.join(BEST_MODEL_DIR, "training_log.json"), "w") as f:
         json.dump(training_log, f, indent=2)
 
 
@@ -467,6 +454,8 @@ def main():
     print(__doc__)
     print(f"  Islands={N_ISLANDS} × {ISLAND_SIZE} = {N_ISLANDS*ISLAND_SIZE} total")
     print(f"  Gen={N_GEN}  Episodes/eval={N_EPISODES}  MaxSteps={MAX_STEPS}")
+    print(f"  N_ATOMS={N_ATOMS}  Vmin={Vmin}  Vmax={Vmax}  DELTA_Z={DELTA_Z:.1f}")
+    print(f"  EPSILON={EPSILON}  Trees/individual={N_TOTAL}")
     print(
         f"  TreeMaxH={TREE_MAX_H}  MigrateEvery={MIGRATION_FREQ}  "
         f"StagLimit={STAGNATION_LIMIT}  TimeLimit={TIME_LIMIT_HOURS}h\n"
@@ -476,7 +465,6 @@ def main():
     start_time   = time.time()
     training_log = []
 
-    # init
     islands = [toolbox.population(n=ISLAND_SIZE) for _ in range(N_ISLANDS)]
     for isle in islands:
         for ind, fit in zip(isle, map(toolbox.evaluate, isle)):
@@ -503,7 +491,6 @@ def main():
             break
 
         for idx, isle in enumerate(islands):
-
             offspring = toolbox.select(isle, len(isle))
             offspring = list(map(toolbox.clone, offspring))
 
@@ -522,13 +509,10 @@ def main():
             for ind, fit in zip(invalid, map(toolbox.evaluate, invalid)):
                 ind.fitness.values = fit
 
-            # elitism — keep best of previous generation
             elite = tools.selBest(isle, 1)
             offspring[-1] = toolbox.clone(elite[0])
-
             islands[idx][:] = offspring
 
-            # stagnation check
             cur_best = max(isle, key=lambda ind: ind.fitness.values[0]).fitness.values[0]
             if cur_best <= isle_best[idx] + 0.01:
                 stag_counters[idx] += 1
@@ -542,7 +526,6 @@ def main():
                 stag_counters[idx] = 0
                 print(f"  ↺ island[{idx}] stagnant → +{n_imm} immigrants  (gen {gen})")
 
-        # ring migration
         if gen % MIGRATION_FREQ == 0:
             migrate(islands)
             print(f"  ↔ migration  (gen {gen})")
@@ -560,7 +543,6 @@ def main():
             f"stag={stag_counters}  t={elapsed_h:.2f}h"
         )
 
-        # checkpoint every 5 gens
         if gen % 5 == 0:
             print_individual(global_hof[0], f"Gen {gen} best")
             training_log.append({
@@ -571,10 +553,9 @@ def main():
             })
             _save_best(global_hof[0], training_log)
 
-    # final save
-    print("\n" + "=" * 66)
+    print("\n" + "=" * 70)
     print("  EVOLUTION COMPLETE — TOP 5 INDIVIDUALS")
-    print("=" * 66)
+    print("=" * 70)
     for rank, ind in enumerate(global_hof, 1):
         print_individual(ind, f"Rank #{rank}")
 
@@ -586,9 +567,9 @@ def main():
     _save_best(global_hof[0], training_log)
 
     print(f"\n  Model saved → {BEST_MODEL_DIR}/")
-    print(f"    best_individual.pkl   (reload with pickle)")
-    print(f"    best_individual.json  (human-readable expressions)")
-    print(f"    training_log.json     (per-checkpoint stats)")
+    print(f"    best_individual.pkl")
+    print(f"    best_individual.json  (actor + {N_ATOMS} critic atom trees + supports)")
+    print(f"    training_log.json")
 
     print("\n── Deterministic Eval of Best Individual ──")
     eval_deterministic(global_hof[0], n_episodes=5)

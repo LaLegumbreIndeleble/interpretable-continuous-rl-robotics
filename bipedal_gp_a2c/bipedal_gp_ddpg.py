@@ -70,6 +70,8 @@ STAGNATION_LIMIT = 15
 IMMIGRANT_RATIO  = 0.15
 CRITIC_MUTPB     = 0.10
 
+TIMEOUT_PENALTY  = 50.0  # subtracted when episode ends by time truncation (stood still)
+
 TIME_LIMIT_HOURS = 20.0
 
 RANDOM_SEED = 42
@@ -220,6 +222,7 @@ def evaluate(individual):
     for ep in range(N_EPISODES):
         obs, _ = env.reset(seed=RANDOM_SEED + ep)
         total    = 0.0
+        timed_out = False
         ou_state = np.zeros(N_ACTIONS, dtype=np.float32)  # reset OU each episode
 
         for _ in range(MAX_STEPS):
@@ -254,7 +257,13 @@ def evaluate(individual):
             obs, reward, terminated, truncated, _ = env.step(action)
             total += reward
             if terminated or truncated:
+                timed_out = truncated and not terminated
                 break
+        else:
+            timed_out = True  # MAX_STEPS exhausted without env signal
+
+        if timed_out:
+            total -= TIMEOUT_PENALTY
 
         rewards.append(total)
 
