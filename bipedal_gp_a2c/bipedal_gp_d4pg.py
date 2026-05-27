@@ -82,7 +82,9 @@ STAGNATION_LIMIT = 15
 IMMIGRANT_RATIO  = 0.15
 CRITIC_MUTPB     = 0.10   # per-atom tree mutation rate
 
-TIMEOUT_PENALTY  = 50.0  # subtracted when episode ends by time truncation (stood still)
+TIMEOUT_PENALTY    = 50.0  # max penalty when truncated and fully stuck
+PROGRESS_WINDOW    = 200   # recent steps used to measure movement
+PROGRESS_THRESHOLD = 0.5   # reward/step above this → considered still moving, no penalty
 
 TIME_LIMIT_HOURS = 20.0
 
@@ -248,8 +250,9 @@ def evaluate(individual):
 
     for ep in range(N_EPISODES):
         obs, _ = env.reset(seed=RANDOM_SEED + ep)
-        total  = 0.0
-        timed_out = False
+        total          = 0.0
+        timed_out      = False
+        recent_rewards = []
 
         for _ in range(MAX_STEPS):
             # ── deterministic actor ────────────────────────────
@@ -284,6 +287,7 @@ def evaluate(individual):
 
             obs, reward, terminated, truncated, _ = env.step(action)
             total += reward
+            recent_rewards.append(reward)
             if terminated or truncated:
                 timed_out = truncated and not terminated
                 break
@@ -291,7 +295,10 @@ def evaluate(individual):
             timed_out = True  # MAX_STEPS exhausted without env signal
 
         if timed_out:
-            total -= TIMEOUT_PENALTY
+            window = recent_rewards[-PROGRESS_WINDOW:]
+            progress_rate = float(np.mean(window)) if window else 0.0
+            penalty_scale = max(0.0, 1.0 - max(0.0, progress_rate) / PROGRESS_THRESHOLD)
+            total -= TIMEOUT_PENALTY * penalty_scale
 
         rewards.append(total)
 
